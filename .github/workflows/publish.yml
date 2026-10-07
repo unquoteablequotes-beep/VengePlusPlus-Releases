@@ -1,0 +1,84 @@
+name: Publish Venge++ release
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Verified native artifact transfer manifest
+        required: true
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Transfer verified client packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os,json,urllib.request,hashlib,zipfile,tempfile,pathlib,re
+          event=json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          source=json.loads(event['inputs']['source'])
+          version=source['version']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          repo=os.environ['GITHUB_REPOSITORY']
+          assert repo=='unquoteablequotes-beep/VengePlusPlus-Releases'
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          def api(route,method='GET',data=None):
+              body=None if data is None else json.dumps(data).encode()
+              req=urllib.request.Request('https://api.github.com/repos/'+repo+route,data=body,headers={**headers,'Content-Type':'application/json'},method=method)
+              with urllib.request.urlopen(req,timeout=180) as r:
+                  return None if r.status==204 else json.load(r)
+          release=next(r for r in api('/releases') if r['tag_name']=='v'+version)
+          assert release['draft'],'Never replace a published release'
+          existing={a['name']:a for a in api('/releases/'+str(release['id'])+'/assets')}
+          def upload(name,filename,digest):
+              size=filename.stat().st_size
+              old=existing.get(name)
+              if old and old.get('state')=='uploaded':
+                  assert old['size']==size and old.get('digest')=='sha256:'+digest,'Existing asset differs'
+                  print('Verified existing '+name,flush=True)
+                  return
+              if old: api('/releases/assets/'+str(old['id']),'DELETE')
+              url=release['upload_url'].split('{')[0]+'?name='+urllib.parse.quote(name)
+              assert urllib.parse.urlparse(url).hostname=='uploads.github.com'
+              req=urllib.request.Request(url,data=filename.read_bytes(),method='POST',headers={**headers,'Content-Type':'application/octet-stream','Content-Length':str(size)})
+              with urllib.request.urlopen(req,timeout=300) as response: result=json.load(response)
+              assert result['size']==size and result.get('digest')=='sha256:'+digest
+              print('Uploaded '+name,flush=True)
+          sums=[]
+          names=set()
+          assert len(source['artifacts'])==4
+          for artifact in source['artifacts']:
+              print('Transferring '+artifact['name'],flush=True)
+              assert artifact['name'] in ['VengePlusPlus-win-x64','VengePlusPlus-linux-x64','VengePlusPlus-mac-x64','VengePlusPlus-mac-arm64']
+              assert urllib.parse.urlparse(artifact['url']).scheme=='https'
+              with tempfile.TemporaryDirectory() as folder:
+                  archive=pathlib.Path(folder)/'artifact.zip'
+                  urllib.request.urlretrieve(artifact['url'],archive)
+                  with archive.open('rb') as stream: actual=hashlib.file_digest(stream,'sha256').hexdigest()
+                  assert 'sha256:'+actual==artifact['digest'],'Artifact checksum failed'
+                  with zipfile.ZipFile(archive) as z:
+                      for entry in z.infolist():
+                          name=entry.filename
+                          if artifact['name'].startswith('VengePlusPlus-mac-') and ('-mac-'+artifact['name'][len('VengePlusPlus-mac-'):]+'.') not in name: continue
+                          assert re.fullmatch(r'VengePlusPlus-[\w.+-]+\.(exe|AppImage|deb|dmg|zip)',name) and version in name and name not in names
+                          names.add(name)
+                          file=pathlib.Path(folder)/name
+                          with z.open(entry) as inp,file.open('wb') as out:
+                              while chunk:=inp.read(1024*1024): out.write(chunk)
+                          with file.open('rb') as stream: digest=hashlib.file_digest(stream,'sha256').hexdigest()
+                          upload(name,file,digest)
+                          sums.append(digest+'  '+name)
+                          file.unlink()
+          assert len(names)==8,'All platform packages are required'
+          with tempfile.TemporaryDirectory() as folder:
+              checks=pathlib.Path(folder)/'SHA256SUMS.txt'
+              checks.write_text('\n'.join(sorted(sums))+'\n')
+              upload(checks.name,checks,hashlib.sha256(checks.read_bytes()).hexdigest())
+          assets=api('/releases/'+str(release['id'])+'/assets')
+          assert len(assets)==9 and all(any(a['name']==n for a in assets) for n in names)
+          api('/releases/'+str(release['id']),'PATCH',{'draft':False,'make_latest':'true'})
+          print('Published Venge++ v1 ('+version+')',flush=True)
+          PY
